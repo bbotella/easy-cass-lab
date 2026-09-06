@@ -28,6 +28,7 @@ import com.rustyrazorblade.easydblab.providers.docker.DockerClientProvider
 import com.rustyrazorblade.easydblab.proxy.HttpClientFactory
 import com.rustyrazorblade.easydblab.proxy.ProxyAvailability
 import com.rustyrazorblade.easydblab.proxy.SocksProxyService
+import com.rustyrazorblade.easydblab.services.aws.AwsS3BucketService
 import com.rustyrazorblade.easydblab.services.aws.EC2InstanceService
 import com.rustyrazorblade.easydblab.services.aws.EMRService
 import com.rustyrazorblade.easydblab.services.aws.OpenSearchService
@@ -104,10 +105,25 @@ val servicesModule =
         singleOf(::DefaultVictoriaLogsService) bind VictoriaLogsService::class
         factoryOf(::SidecarManifestBuilder)
         factoryOf(::DefaultSidecarService) bind SidecarService::class
+
+        // Turns the nodes' ECR IAM permission into registry credentials a pod can use
+        singleOf(::EcrPullSecretService)
         // Explicit single (not singleOf) so the jobPollInterval constructor default applies
         // instead of Koin trying to resolve a Duration binding.
-        single<StressJobService> { DefaultStressJobService(get(), get(), get(), get()) }
+        single<StressJobService> { DefaultStressJobService(get(), get(), get(), get(), get()) }
         singleOf(::HostOperationsService)
+
+        // Builds a Cassandra branch checkout on this machine
+        singleOf(::CassandraBuildService)
+
+        // The profile's published Cassandra builds, stored in the account bucket
+        single {
+            CassandraBuildCatalog(
+                get<ObjectStore>(),
+                get<AwsS3BucketService>(),
+                get<User>(),
+            )
+        }
 
         // Kit command scanner — discovers @KitCommand-annotated classes across all JARs
         singleOf(::DefaultKitCommandScanner) bind KitCommandScanner::class
