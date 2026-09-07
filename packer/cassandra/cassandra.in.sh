@@ -10,7 +10,110 @@ if [ -f "$ECL_AGENTS_LIB" ]; then
     # shellcheck disable=SC1090
     . "$ECL_AGENTS_LIB"
 else
-    echo "ERROR: $ECL_AGENTS_LIB is missing; Cassandra will start with NO metrics agent" >&2
+    echo "ERROR: $ECL_AGENTS_LIB is missing; Cassandra will start with NO AxonOps agent" >&2
+fi
+
+# edl_add_jvm_extra_opt <opt>... - append options to JVM_EXTRA_OPTS without clobbering what is
+# already there. Every agent below adds to the same variable, so a plain assignment would silently
+# drop whichever agent was configured first.
+#
+# JVM_EXTRA_OPTS, not JVM_OPTS: bin/nodetool sources this file and puts $JVM_OPTS on its own java
+# command line, so an agent on JVM_OPTS starts again for every nodetool, sstableloader and
+# cassandra-stress run. nodetool saves and restores JVM_OPTS around that, and discards
+# JVM_EXTRA_OPTS entirely, which is exactly what an agent wants.
+#
+# This helper lives here rather than in edl-cassandra-agents.sh: that file holds pure functions
+# with no side effects, and this one exports.
+edl_add_jvm_extra_opt() {
+    for _edl_opt in "$@"; do
+        JVM_EXTRA_OPTS="${JVM_EXTRA_OPTS:+$JVM_EXTRA_OPTS }$_edl_opt"
+    done
+    export JVM_EXTRA_OPTS
+}
+
+# OpenTelemetry Java agent. Its JMX Metric Insight module reads Cassandra's own MBeans in-process
+# and reports them over OTLP to the node's collector.
+#
+# It sits above the release and JDK derivation on purpose. The agent needs neither of them, so a
+# jar name this file cannot parse costs the node its AxonOps agent but never its metrics.
+EDL_OTEL_AGENT_JAR="${EDL_OTEL_AGENT_JAR:-/usr/local/otel/opentelemetry-javaagent.jar}"
+
+# The complete JMX rule set, and the agent's only rule source: `otel.jmx.target.system` is
+# deliberately not set. The built-in experimental-cassandra target is experimental upstream, so its
+# metric names can move between agent releases and take every dashboard panel with them. Owning the
+# rules pins those names to this repo.
+#
+# Written by the CLI (`setup-instances`), not baked into the AMI, so a rule change needs no rebake.
+EDL_OTEL_JMX_CONFIG="${EDL_OTEL_JMX_CONFIG:-/etc/easy-db-lab/cassandra-jmx-rules.yaml}"
+
+# Which build this node is actually running, as a metric label.
+#
+# A mixed-version A/B is the normal case on this rig: some nodes on a stock release, others on a
+# locally built branch, and not always the same nodes. Without this every comparison dashboard has
+# to hardcode host names, which is exactly what breaks when the split changes.
+#
+# The value is the target of /usr/local/cassandra/current - the directory name `cassandra use`
+# selects, e.g. "5.0" or "5.0.9-rrb-j21-20260906-8ba1639-jdk21". It is read here, at JVM start,
+# rather than pushed from the CLI, so `cassandra use` on a subset of hosts needs no re-push: the
+# next restart of that node picks up its own new value and no other node is touched.
+#
+# ReleaseVersion off the StorageService MBean is NOT used for this. It reports 5.0.9 against
+# 5.0.9-SNAPSHOT here, which separates stock from branch but collapses every branch build into one
+# value - two different branches under test would be indistinguishable.
+EDL_CASSANDRA_BUILD=$(basename "$(readlink -f /usr/local/cassandra/current 2>/dev/null)" 2>/dev/null)
+if [ -z "$EDL_CASSANDRA_BUILD" ]; then
+    EDL_CASSANDRA_BUILD="unknown"
+    echo "WARNING: could not read the target of /usr/local/cassandra/current;" >&2
+    echo "WARNING: this node reports cassandra_build=unknown and will not group with its variant." >&2
+fi
+
+if [ -f "$EDL_OTEL_AGENT_JAR" ]; then
+    # service.instance.id is pinned to the hostname deliberately. The agent's default is a fresh
+    # UUID for every JVM start, which mints a new Prometheus `instance` series on every restart.
+    #
+    # otel.jmx.discovery.delay defaults to 60000ms. That would hold the first metrics back to
+    # roughly 61 seconds and delay picking up a newly created table by up to a minute.
+    # Port 4318, not 4317. The agent's default OTLP protocol is http/protobuf, and the collector
+    # serves that on 4318; 4317 is its gRPC port, where every export failed with "HttpExporter -
+    # Failed to export". edl-profiling-reconcile posts to 4318 for the same reason.
+    edl_add_jvm_extra_opt \
+        "-javaagent:${EDL_OTEL_AGENT_JAR}" \
+        "-Dotel.service.name=cassandra" \
+        "-Dotel.resource.attributes=service.instance.id=$(hostname),node_role=db,cassandra_build=${EDL_CASSANDRA_BUILD}" \
+        "-Dotel.exporter.otlp.endpoint=http://localhost:4318" \
+        "-Dotel.metric.export.interval=5s" \
+        "-Dotel.jmx.discovery.delay=5000"
+
+    # JVM runtime telemetry beyond the default set. Both flags were established by running the
+    # v2.31.1 agent against a throwaway JVM and reading what it emitted; none of the following is
+    # guessable from the property names, so it is written down here.
+    #
+    # - emit-experimental-jfr-metrics is what produces an allocation metric. The obvious-looking
+    #   `otel.instrumentation.runtime-telemetry-java17.enable-all` is a LEGACY name at 2.31.1 and
+    #   does nothing at all: the java8 and java17 modules are merged into one
+    #   io.opentelemetry.runtime-telemetry. Setting it looks right and ships inert.
+    # - The JFR flag needs JDK 17+. Below that it is silently inert rather than an error, so a node
+    #   on an older JDK loses these metrics without saying so. Every db node runs 17 or 21.
+    # - jvm.memory.allocation is a HISTOGRAM, not a counter, with attribute arena=TLAB|Main. An
+    #   allocation rate comes from its _sum, never a _total that does not exist.
+    # - JFR recording costs the measured JVM a little continuously. This is a benchmarking rig, so
+    #   that is a real if small cost, taken deliberately.
+    #
+    # emit-experimental-telemetry is the non-JFR half: file descriptors, buffer pools, system CPU
+    # load. It works on any JDK and carries no allocation metric of its own. The two combine.
+    edl_add_jvm_extra_opt \
+        "-Dotel.instrumentation.runtime-telemetry.emit-experimental-jfr-metrics=true" \
+        "-Dotel.instrumentation.runtime-telemetry.emit-experimental-telemetry=true"
+
+    if [ -f "$EDL_OTEL_JMX_CONFIG" ]; then
+        edl_add_jvm_extra_opt "-Dotel.jmx.config=${EDL_OTEL_JMX_CONFIG}"
+    else
+        echo "ERROR: $EDL_OTEL_JMX_CONFIG is missing. It holds every JMX rule, so this node will" >&2
+        echo "ERROR: report NO Cassandra metrics - only JVM and host telemetry." >&2
+        echo "ERROR: Run 'easy-db-lab setup-instances' to write it, then restart Cassandra." >&2
+    fi
+else
+    echo "ERROR: $EDL_OTEL_AGENT_JAR is missing; this node will report NO Cassandra metrics." >&2
 fi
 
 # Extract Cassandra version from jar filename
@@ -22,14 +125,15 @@ fi
 
 # An unrecognised jar name leaves ECL_CASSANDRA_VERSION empty and says so. It must never carry the
 # raw filename forward: that is what used to match no agent case and start Cassandra silently
-# without a metrics agent.
+# without an agent.
 ECL_CASSANDRA_VERSION=""
 if command -v edl_cassandra_version_from_jar >/dev/null 2>&1; then
     ECL_CASSANDRA_VERSION=$(edl_cassandra_version_from_jar "$ECL_CASSANDRA_JAR") || ECL_CASSANDRA_VERSION=""
 fi
 if [ -z "$ECL_CASSANDRA_VERSION" ]; then
     echo "ERROR: could not read a Cassandra X.Y release from $(basename "$ECL_CASSANDRA_JAR")." >&2
-    echo "ERROR: no agent can be selected, so this node will report NO Cassandra metrics." >&2
+    echo "ERROR: no AxonOps agent can be selected. Metrics are unaffected: the OTel agent above" >&2
+    echo "ERROR: needs neither the release nor the JDK." >&2
 fi
 export ECL_CASSANDRA_VERSION
 
@@ -61,48 +165,9 @@ fi
 if [ -n "$AXONOPS_AGENT" ]; then
     ECL_AGENT_JAR=$(find "${EDL_AXONOPS_BASE:-/usr/share/axonops}/${AXONOPS_AGENT}/lib" -maxdepth 1 -name 'axon-cassandra*.jar' 2>/dev/null | head -n 1)
     if [ -f "$ECL_AGENT_JAR" ]; then
-        export JVM_EXTRA_OPTS="-javaagent:${ECL_AGENT_JAR}=/etc/axonops/axon-agent.yml"
+        edl_add_jvm_extra_opt "-javaagent:${ECL_AGENT_JAR}=/etc/axonops/axon-agent.yml"
     else
         echo "WARNING: AxonOps agent jar not found for $AXONOPS_AGENT" >&2
-    fi
-fi
-
-# MCAC/MAAC (Management API for Apache Cassandra) metrics agent.
-# Exposes Cassandra metrics as a Prometheus endpoint on port 9000, which the node's OTel collector
-# scrapes. Every path below reports what it did: a node with no metrics agent is a node whose
-# Cassandra metrics never reach VictoriaMetrics, and that must not happen quietly.
-MAAC_AGENT_JAR=""
-if [ -n "$ECL_CASSANDRA_VERSION" ]; then
-    MAAC_AGENT_JAR=$(edl_maac_agent_jar_for "$ECL_CASSANDRA_VERSION") || MAAC_AGENT_JAR=""
-    if [ -z "$MAAC_AGENT_JAR" ]; then
-        echo "WARNING: no MCAC metrics agent is installed for Cassandra ${ECL_CASSANDRA_VERSION};" >&2
-        echo "WARNING: this node will report NO Cassandra metrics. Add it in packer/cassandra/install/install_maac.sh." >&2
-    fi
-fi
-
-if [ -n "$MAAC_AGENT_JAR" ]; then
-    if [ -f "$MAAC_AGENT_JAR" ]; then
-        export MAAC_PATH="${EDL_MAAC_BASE:-/opt/management-api}"
-        POD_NAME=$(hostname)
-        export POD_NAME
-        export JVM_OPTS="$JVM_OPTS -javaagent:${MAAC_AGENT_JAR}"
-
-        # The agent's Prometheus endpoint is a Netty HTTP server, but netty-codec-http is
-        # `provided` in the agent build and is not bundled in the agent jar. Cassandra 4.x shipped
-        # a fat netty-all that happened to contain it; 5.0 and later ship granular netty modules
-        # plus an empty netty-all aggregator that does not, so the endpoint dies with
-        # NoClassDefFoundError io/netty/handler/codec/http/HttpServerCodec and the node reports
-        # nothing. install-cassandra-version puts the matching jar in the release's lib directory;
-        # check it is there rather than discovering it in a stack trace.
-        ECL_CASSANDRA_LIB="${CASSANDRA_HOME:-/usr/local/cassandra/current}/lib"
-        if ! ls "${ECL_CASSANDRA_LIB}"/netty-codec-http-*.jar >/dev/null 2>&1 \
-           && [ -z "$(find "$ECL_CASSANDRA_LIB" -maxdepth 1 -name 'netty-all-*.jar' -size +1M 2>/dev/null)" ]; then
-            echo "WARNING: no netty-codec-http jar in ${ECL_CASSANDRA_LIB};" >&2
-            echo "WARNING: the MCAC metrics endpoint cannot start, so this node will report NO Cassandra metrics." >&2
-        fi
-    else
-        echo "WARNING: MCAC metrics agent jar not found at $MAAC_AGENT_JAR;" >&2
-        echo "WARNING: this node will report NO Cassandra metrics." >&2
     fi
 fi
 

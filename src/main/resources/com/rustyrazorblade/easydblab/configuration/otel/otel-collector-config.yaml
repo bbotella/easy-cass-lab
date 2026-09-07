@@ -14,13 +14,40 @@ receivers:
         endpoint: 0.0.0.0:6831
   hostmetrics:
     collection_interval: 10s
+    # The collector is a container, so without this the scrapers describe the container rather than
+    # the node. filesystem in particular saw nothing at all and reported no series, which is why
+    # every filesystem panel was empty. A receiver-level setting, not a per-scraper one; the host
+    # root is bind-mounted read-only at /hostfs by OtelManifestBuilder.
+    root_path: /hostfs
     scrapers:
       cpu:
       disk:
       load:
       filesystem:
+        # Virtual filesystems - overlay, tmpfs, devtmpfs, sysfs, proc, cgroup - are already absent:
+        # include_virtual_filesystems defaults to false, and the scraper passes that straight to
+        # gopsutil, which then lists only filesystems that are not `nodev` in /proc/filesystems.
+        #
+        # squashfs is the exception. It is device-backed, so it is not filtered by that default, and
+        # every snap on an Ubuntu host is a separate read-only squashfs mount at 100% full. Left in,
+        # they crowd out the real disks on any filesystem panel.
+        exclude_fs_types:
+          fs_types:
+            - squashfs
+          match_type: strict
+        # system.filesystem.utilization is an optional metric and is OFF by default - measured, not
+        # assumed. It is the ready-made 0-1 fraction the disk-usage panel wants; without it a panel
+        # has to derive the ratio from the used/free/reserved states itself.
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
       memory:
       network:
+      paging:
+        # Same story: system.paging.utilization is optional and off by default.
+        metrics:
+          system.paging.utilization:
+            enabled: true
       processes:
   prometheus:
     config:
@@ -41,15 +68,6 @@ receivers:
           relabel_configs:
             - target_label: instance
               replacement: '${env:HOSTNAME}:9435'
-            - target_label: cluster
-              replacement: '${env:CLUSTER_NAME}'
-        - job_name: 'cassandra-maac'
-          scrape_interval: 15s
-          static_configs:
-            - targets: ['localhost:9000']
-          relabel_configs:
-            - target_label: instance
-              replacement: '${env:HOSTNAME}:9000'
             - target_label: cluster
               replacement: '${env:CLUSTER_NAME}'
         - job_name: 'yace'
@@ -170,11 +188,70 @@ processors:
   batch:
     timeout: 10s
     send_batch_size: 1024
+  # Required by the metrics/logs pipeline, and the single most silent failure in this file.
+  #
+  # The count connector emits Sums with AggregationTemporality: Delta, and signaltometrics emits
+  # delta histograms. prometheusremotewrite accepts CUMULATIVE ONLY and discards delta points
+  # without an error log, without incrementing send_failed, and without any dropped-points counter.
+  # Every diagnostic surface reports a healthy pipeline while the data goes nowhere.
+  #
+  # That is not a hypothetical: it is exactly how this shipped the first time. The connectors were
+  # producing correct points carrying cassandra_build, host.name and node_role, the OTTL conditions
+  # matched, the pipeline was constructed - and cassandra_log_* never appeared in VictoriaMetrics.
+  # It was found only by attaching a debug exporter to the pipeline and reading the descriptor.
+  #
+  # Anything added to metrics/logs later inherits this constraint. A connector-derived metric that
+  # bypasses this processor disappears the same silent way.
+  deltatocumulative:
+    max_stale: 5m
   resource/cluster:
     attributes:
       - action: upsert
         key: cluster
         value: '${env:CLUSTER_NAME}'
+  # Strip the SDK's default resource from OTLP metrics.
+  #
+  # The OTel Java agent stamps every export with its own identity and the JVM's. None of it is
+  # queryable, and process.command_line is actively harmful: it carries the full argv, so it CHANGES
+  # on `cassandra use` and mints a whole new series set, breaking panel continuity across a version
+  # switch. The agent-side property otel.experimental.resource.disabled.keys does not work at
+  # v2.31.1, so the drop happens here.
+  #
+  # What survives is what a dashboard actually selects on: cluster, host.name, node_role, instance,
+  # job, service.name, service.instance.id, and the rule-supplied keyspace, table,
+  # cassandra.operation and cassandra.status.
+  resource/drop_sdk_metadata:
+    attributes:
+      - action: delete
+        key: process.command_line
+      - action: delete
+        key: process.executable.path
+      - action: delete
+        key: process.pid
+      - action: delete
+        key: process.runtime.description
+      - action: delete
+        key: process.runtime.name
+      - action: delete
+        key: process.runtime.version
+      - action: delete
+        key: os.description
+      - action: delete
+        key: os.type
+      - action: delete
+        key: os.version
+      - action: delete
+        key: host.arch
+      - action: delete
+        key: telemetry.distro.name
+      - action: delete
+        key: telemetry.distro.version
+      - action: delete
+        key: telemetry.sdk.language
+      - action: delete
+        key: telemetry.sdk.name
+      - action: delete
+        key: telemetry.sdk.version
   resourcedetection:
     detectors: [system]
     system:
@@ -189,6 +266,106 @@ processors:
       - context: log
         statements:
           - set(attributes["service"], resource.attributes["k8s.app.instance"]) where resource.attributes["k8s.app.instance"] != ""
+
+  # Lift the logger name and severity onto the log record so the count connector can group by them.
+  #
+  # The Java agent puts the logger name in the InstrumentationScope, not in the record's attributes,
+  # and the count connector's `attributes` reads record attributes only. Without this copy, counting
+  # "by logger" silently groups everything into one series.
+  transform/log_metric_labels:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["logger"], instrumentation_scope.name) where instrumentation_scope.name != ""
+          - set(attributes["severity"], severity_text) where severity_text != ""
+
+          # EVERY numeric capture below allows a comma and strips it before converting. Cassandra
+          # prints large numbers with thousands separators - "in 520,866ms" is a real line from this
+          # cluster - and a [0-9]+ capture does not fail loudly on one. It either matches nothing,
+          # losing exactly the slowest events, or matches the leading group and is wrong by three
+          # orders of magnitude. Both were measured; neither reports an error.
+
+          # GC events. GCInspector logs one line per collection carrying the duration the JVM
+          # metrics only expose in aggregate. Both collectors use the same shape, so one pattern
+          # serves G1 and ZGC:
+          #   "G1 Young Generation GC in 635ms.  G1 Eden Space: 8220835840 -> 0; ..."
+          #   "ZGC Major Cycles GC in 76,781ms.  ZGC Old Generation: 58720256 -> 167772160; ..."
+          #
+          # gc_name is the label and it is load-bearing, not decoration. A "ZGC Major Cycles" line
+          # times CONCURRENT work - 76 seconds of it - while a "G1 Young Generation" line times a
+          # stop-the-world pause of a few hundred ms. Averaging across the two produces a number
+          # that means nothing, which is why the metric is named for the event's duration rather
+          # than for a pause: a consumer wanting pauses filters gc_name, exactly as on the JMX side.
+          #
+          # The heap before/after figures in the rest of the line are left alone - per-pool, and
+          # already covered by jvm.memory.used.
+          - >-
+            merge_maps(attributes,
+              ExtractPatterns(body, "^(?P<gc_name>[A-Za-z0-9 ]+?) GC in (?P<gc_event_ms>[0-9,]+)ms"),
+              "upsert")
+            where IsMatch(body, "GC in [0-9,]+ms")
+          - replace_pattern(attributes["gc_event_ms"], ",", "") where attributes["gc_event_ms"] != nil
+          - set(attributes["gc_event_ms"], Double(attributes["gc_event_ms"])) where attributes["gc_event_ms"] != nil
+
+          # Compactions. CompactionTask logs one line per compaction:
+          #   "Compacted (<uuid>) 4 sstables to [<path>,] to level=0.  9.049KiB to 4.033KiB
+          #    (~44% of original) in 520,866ms. ... 7 total partitions merged to 3. ..."
+          #
+          # The ratio is taken straight from the "(~44% of original)" the line already computes -
+          # the one figure here that nothing else exposes. The byte counts on either side of it are
+          # human-formatted ("9.049KiB"), so reading them would mean unit handling for a number the
+          # compaction byte counters already carry; the ratio makes them unnecessary anyway.
+          #
+          # The uuid and the sstable path on this line are unbounded and are labels on nothing.
+          - >-
+            merge_maps(attributes,
+              ExtractPatterns(body, "^Compacted \\([^)]+\\) (?P<compaction_sstables>[0-9,]+) sstables"),
+              "upsert")
+            where IsMatch(body, "^Compacted \\(")
+          - >-
+            merge_maps(attributes,
+              ExtractPatterns(body, "\\(~(?P<compaction_ratio_pct>[0-9,]+)% of original\\)"),
+              "upsert")
+            where IsMatch(body, "^Compacted \\(")
+          - >-
+            merge_maps(attributes,
+              ExtractPatterns(body, "of original\\) in (?P<compaction_ms>[0-9,]+)ms"),
+              "upsert")
+            where IsMatch(body, "^Compacted \\(")
+          # Dropped messages. One line per verb per 5-second window:
+          #   "MUTATION_RSP messages were dropped in last 5000 ms: 0 internal and 33 cross node.
+          #    Mean internal dropped latency: 0 ms and Mean cross-node dropped latency: 4 ms"
+          #
+          # The JMX counter says how many messages dropped. Only this line says of WHAT TYPE, and
+          # splits internal from cross-node - a distinction the counter cannot express and the one
+          # that separates "this node is overloaded" from "the network or a peer is".
+          #
+          # The logger is org.apache.cassandra.metrics.MessagingMetrics. It is neither
+          # MessagingService nor NoSpamLogger, which is what makes this worth pinning: a condition
+          # on the wrong logger matches nothing, forever, without an error.
+          #
+          # dropped_type is a verb name from a bounded set. Every count and latency is a value.
+          - >-
+            merge_maps(attributes,
+              ExtractPatterns(body,
+                "^(?P<dropped_type>[A-Z0-9_]+) messages were dropped in last [0-9,]+ ms: (?P<dropped_internal>[0-9,]+) internal and (?P<dropped_cross_node>[0-9,]+) cross node\\. Mean internal dropped latency: (?P<dropped_internal_ms>[0-9,]+) ms and Mean cross-node dropped latency: (?P<dropped_cross_node_ms>[0-9,]+) ms"),
+              "upsert")
+            where IsMatch(body, "messages were dropped in last")
+          - replace_pattern(attributes["dropped_internal"], ",", "") where attributes["dropped_internal"] != nil
+          - replace_pattern(attributes["dropped_cross_node"], ",", "") where attributes["dropped_cross_node"] != nil
+          - replace_pattern(attributes["dropped_internal_ms"], ",", "") where attributes["dropped_internal_ms"] != nil
+          - replace_pattern(attributes["dropped_cross_node_ms"], ",", "") where attributes["dropped_cross_node_ms"] != nil
+          - set(attributes["dropped_internal"], Double(attributes["dropped_internal"])) where attributes["dropped_internal"] != nil
+          - set(attributes["dropped_cross_node"], Double(attributes["dropped_cross_node"])) where attributes["dropped_cross_node"] != nil
+          - set(attributes["dropped_internal_ms"], Double(attributes["dropped_internal_ms"])) where attributes["dropped_internal_ms"] != nil
+          - set(attributes["dropped_cross_node_ms"], Double(attributes["dropped_cross_node_ms"])) where attributes["dropped_cross_node_ms"] != nil
+
+          - replace_pattern(attributes["compaction_sstables"], ",", "") where attributes["compaction_sstables"] != nil
+          - replace_pattern(attributes["compaction_ratio_pct"], ",", "") where attributes["compaction_ratio_pct"] != nil
+          - replace_pattern(attributes["compaction_ms"], ",", "") where attributes["compaction_ms"] != nil
+          - set(attributes["compaction_sstables"], Double(attributes["compaction_sstables"])) where attributes["compaction_sstables"] != nil
+          - set(attributes["compaction_ratio_pct"], Double(attributes["compaction_ratio_pct"])) where attributes["compaction_ratio_pct"] != nil
+          - set(attributes["compaction_ms"], Double(attributes["compaction_ms"])) where attributes["compaction_ms"] != nil
 
   # Copy service.name → service_name on the resource so Grafana's auto-generated log queries
   # (which use underscore-style label names) match VictoriaLogs fields.
@@ -237,6 +414,132 @@ exporters:
       insecure: true
 
 connectors:
+  # Turns log records into metrics, so what a logger reports can be charted beside the JMX
+  # families and compared across builds instead of being read as text.
+  #
+  # Nothing here parses a log body. Every label comes from the logger name or the severity, both of
+  # which are bounded sets; a body can carry a keyspace, a table, a host or an id, and grouping on
+  # any of those would be unbounded. Values that live only inside a message stay in VictoriaLogs.
+  #
+  # Resource attributes ride through the connector untouched, so these arrive already carrying
+  # cassandra_build, host.name and node_role - which is what makes them comparable per variant.
+  count:
+    logs:
+      cassandra.log.records:
+        description: Log records at WARN and above, by logger and severity.
+        # severity_number, not severity_text: the text is inconsistent across libraries (Cassandra
+        # logs WARN, the AxonOps agent logs WARNING) and would split one level into two series.
+        conditions:
+          - severity_number >= SEVERITY_NUMBER_WARN
+        attributes:
+          - key: logger
+            default_value: unknown
+          - key: severity
+            default_value: unknown
+      cassandra.log.gc_events:
+        description: GCInspector log events, which carry pause detail the JVM metrics do not.
+        conditions:
+          - IsMatch(instrumentation_scope.name, ".*GCInspector$")
+      cassandra.log.status_dumps:
+        description: StatusLogger dumps, which Cassandra emits under pressure.
+        conditions:
+          - IsMatch(instrumentation_scope.name, ".*StatusLogger$")
+      cassandra.log.dropped_message_reports:
+        description: MessagingMetrics drop reports - one per verb per 5s window in which anything dropped.
+        # MessagingMetrics, verified against real lines. An earlier guess at MessagingService and
+        # NoSpamLogger matched nothing at all, which is the failure this whole file keeps guarding
+        # against: a wrong name here is silent, permanent and looks exactly like "nothing dropped".
+        conditions:
+          - IsMatch(instrumentation_scope.name, ".*MessagingMetrics$")
+
+  # Turns the figures parsed out of a log body into metrics whose VALUE is the number, not the
+  # number of records. The count connector above cannot do this: it only ever emits how many
+  # matched, so a GC pause would arrive as "47 events" rather than "47.3 ms" - a mistake that looks
+  # like it worked.
+  #
+  # Histograms rather than sums, throughout. jvm.gc.duration already gives aggregate time spent in
+  # GC; what no aggregate can give is the distribution of individual events, and a single 400ms
+  # outlier is invisible in a total and obvious in a histogram. The same argument applies to
+  # compaction: the mean compaction tells you much less than the shape.
+  signaltometrics:
+    logs:
+      - name: cassandra.log.gc_event_duration_seconds
+        description: Duration of one GCInspector event. See gc_name - Cycles lines are concurrent work, not pauses.
+        unit: s
+        conditions:
+          - attributes["gc_event_ms"] != nil
+        attributes:
+          - key: gc_name
+        histogram:
+          value: Double(attributes["gc_event_ms"]) / 1000
+
+      - name: cassandra.log.compaction_duration_seconds
+        description: Wall time of one compaction, as CompactionTask reports it.
+        unit: s
+        conditions:
+          - attributes["compaction_ms"] != nil
+        histogram:
+          value: Double(attributes["compaction_ms"]) / 1000
+
+      - name: cassandra.log.compaction_ratio
+        description: Compacted size as a fraction of the original. Exposed nowhere else.
+        unit: "1"
+        conditions:
+          - attributes["compaction_ratio_pct"] != nil
+        histogram:
+          value: Double(attributes["compaction_ratio_pct"]) / 100
+
+      - name: cassandra.log.compaction_sstables_merged
+        description: SSTables merged by one compaction.
+        unit: "{sstable}"
+        conditions:
+          - attributes["compaction_sstables"] != nil
+        histogram:
+          value: Double(attributes["compaction_sstables"])
+
+      # Dropped messages. Sums, not histograms: each line reports a count for a 5-second window, so
+      # adding them up is the total dropped. The latencies are means over that window, and their
+      # distribution is what says whether drops were a brief spike or a sustained condition.
+      - name: cassandra.log.dropped_messages_internal
+        description: Messages dropped inside this node, by verb.
+        unit: "{message}"
+        conditions:
+          - attributes["dropped_internal"] != nil
+        attributes:
+          - key: dropped_type
+        sum:
+          value: Double(attributes["dropped_internal"])
+
+      - name: cassandra.log.dropped_messages_cross_node
+        description: Messages dropped in transit from a peer, by verb.
+        unit: "{message}"
+        conditions:
+          - attributes["dropped_cross_node"] != nil
+        attributes:
+          - key: dropped_type
+        sum:
+          value: Double(attributes["dropped_cross_node"])
+
+      - name: cassandra.log.dropped_message_internal_latency_seconds
+        description: Mean latency of internally dropped messages over a 5s window, by verb.
+        unit: s
+        conditions:
+          - attributes["dropped_internal_ms"] != nil
+        attributes:
+          - key: dropped_type
+        histogram:
+          value: Double(attributes["dropped_internal_ms"]) / 1000
+
+      - name: cassandra.log.dropped_message_cross_node_latency_seconds
+        description: Mean latency of cross-node dropped messages over a 5s window, by verb.
+        unit: s
+        conditions:
+          - attributes["dropped_cross_node_ms"] != nil
+        attributes:
+          - key: dropped_type
+        histogram:
+          value: Double(attributes["dropped_cross_node_ms"]) / 1000
+
   # Converts spans to Prometheus metrics (calls_total, latency histograms).
   # Exemplars link metric data points back to individual traces in Tempo.
   spanmetrics:
@@ -276,10 +579,12 @@ service:
       receivers: [hostmetrics, prometheus]
       processors: [resource/cluster, resourcedetection, k8sattributes, batch]
       exporters: [prometheusremotewrite]
-    # Remote metrics via OTLP (e.g., Spark nodes) — stamp cluster label to match local metrics
+    # OTLP metrics — the Cassandra JVM agent, the stress sidecar, Spark nodes. resource/cluster
+    # stamps the cluster label to match local metrics; resource/drop_sdk_metadata removes the SDK's
+    # default resource, which would otherwise ride along as fifteen labels per series.
     metrics/otlp:
       receivers: [otlp]
-      processors: [resource/cluster, resourcedetection, batch]
+      processors: [resource/cluster, resourcedetection, resource/drop_sdk_metadata, batch]
       exporters: [prometheusremotewrite]
     logs/local:
       receivers: [filelog/system, filelog/tools, filelog/cassandra]
@@ -289,13 +594,27 @@ service:
       receivers: [filelog/containers, filelog/clickhouse-containers]
       processors: [k8sattributes, transform/add_service, transform/add_service_name, resource/cluster, batch]
       exporters: [otlphttp/victorialogs]
+    # OTLP logs — the Cassandra JVM agent, chiefly. resource/drop_sdk_metadata matters even more
+    # here than on metrics: process.command_line is kilobytes of argv on EVERY record and forms part
+    # of the VictoriaLogs stream identity, so it both bloats storage and re-keys the stream on a
+    # `cassandra use`. transform/log_metric_labels must run before the count connector, which reads
+    # the attributes it writes.
     logs/otlp:
       receivers: [otlp]
-      processors: [transform/add_service_name, batch]
-      exporters: [otlphttp/victorialogs]
+      processors: [resource/drop_sdk_metadata, transform/add_service_name, transform/log_metric_labels, batch]
+      exporters: [otlphttp/victorialogs, count, signaltometrics]
+    # Metrics derived from those logs. resource/cluster stamps the cluster label, as on every other
+    # metrics pipeline.
+    metrics/logs:
+      receivers: [count, signaltometrics]
+      processors: [resource/cluster, deltatocumulative, batch]
+      exporters: [prometheusremotewrite]
+    # resource/cluster here rather than in each span producer's own resource attributes. Any
+    # producer gets the cluster label for free — the stress job today, Beyla or a future client
+    # tomorrow — and it is the same mechanism every metrics pipeline already uses.
     traces:
       receivers: [otlp, jaeger]
-      processors: [batch]
+      processors: [resource/cluster, batch]
       exporters: [otlp/tempo, spanmetrics, servicegraph]
     metrics/spanmetrics:
       receivers: [spanmetrics]

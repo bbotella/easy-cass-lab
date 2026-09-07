@@ -17,6 +17,18 @@ class OtelManifestBuilderTest : BaseKoinTest() {
     private lateinit var builder: OtelManifestBuilder
     private lateinit var mockClusterStateManager: ClusterStateManager
 
+    /** The body of one named pipeline: every line indented under it, comments excluded. */
+    private fun pipeline(name: String): String {
+        val lines = yamlFrom(builder.buildConfigMap(emptyList())).lines()
+        val start = lines.indexOfFirst { it.trim() == name }
+        check(start >= 0) { "pipeline $name is not in the rendered config" }
+
+        return lines
+            .drop(start + 1)
+            .takeWhile { it.startsWith("      ") }
+            .joinToString("\n")
+    }
+
     private fun yamlFrom(configMap: ConfigMap): String =
         checkNotNull(configMap.data["otel-collector-config.yaml"]) {
             "ConfigMap missing expected data key 'otel-collector-config.yaml'"
@@ -44,6 +56,268 @@ class OtelManifestBuilderTest : BaseKoinTest() {
         builder = OtelManifestBuilder(templateService)
     }
 
+    /**
+     * Cassandra metrics now arrive over OTLP from the OTel Java agent in the Cassandra JVM, not
+     * from a Prometheus endpoint on 9000. Leaving the scrape job behind would have the collector
+     * poll a port nothing listens on, once per node, for the life of every cluster.
+     */
+    @Test
+    fun `buildConfigMap no longer scrapes the MAAC Prometheus endpoint`() {
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).doesNotContain("cassandra-maac")
+        assertThat(yaml).doesNotContain("localhost:9000")
+    }
+
+    /**
+     * The OTel Java agent stamps its own identity and the JVM's onto every metric it exports.
+     * `process.command_line` is the harmful one: it carries the full argv, so it changes on
+     * `cassandra use` and mints a whole new series set, breaking panel continuity across a version
+     * switch. The agent-side property that would suppress it does not work at v2.31.1, so the drop
+     * has to happen in the pipeline that receives those metrics.
+     */
+    @Test
+    fun `buildConfigMap drops the SDK resource from the OTLP metrics pipeline`() {
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("resource/drop_sdk_metadata:")
+        assertThat(yaml).contains("key: process.command_line")
+        assertThat(yaml).contains("key: telemetry.sdk.version")
+
+        val otlpPipeline = yaml.substringAfter("metrics/otlp:").substringBefore("exporters:")
+        assertThat(otlpPipeline).contains("resource/drop_sdk_metadata")
+    }
+
+    /**
+     * The collector is a container. Without the node's root filesystem mounted and `root_path`
+     * pointing at it, the hostmetrics scrapers describe the container, and the filesystem scraper
+     * finds nothing worth reporting at all — which is why every filesystem panel was empty while
+     * `filesystem:` sat in the scrapers list looking correct.
+     */
+    @Test
+    fun `hostmetrics reads the node through a read-only host root mount`() {
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        // root_path belongs to the receiver, not to a scraper: indented two levels, beside
+        // collection_interval, not four levels under `scrapers:`.
+        assertThat(yaml).contains("\n    root_path: ${OtelManifestBuilder.HOST_ROOT_MOUNT_PATH}\n")
+
+        val container =
+            builder
+                .buildDaemonSet()
+                .spec.template.spec.containers
+                .first()
+        val mount = container.volumeMounts.first { it.name == OtelManifestBuilder.HOST_ROOT_VOLUME }
+
+        assertThat(mount.mountPath).isEqualTo(OtelManifestBuilder.HOST_ROOT_MOUNT_PATH)
+        assertThat(mount.readOnly).isTrue()
+
+        val volume =
+            builder
+                .buildDaemonSet()
+                .spec.template.spec.volumes
+                .first { it.name == OtelManifestBuilder.HOST_ROOT_VOLUME }
+
+        assertThat(volume.hostPath.path).isEqualTo("/")
+        assertThat(volume.hostPath.type).isEqualTo("Directory")
+    }
+
+    @Test
+    fun `spans get the cluster label from the pipeline, not from each producer`() {
+        // Every metrics pipeline already stamps cluster this way. Doing it here too means any span
+        // producer is covered — the stress job today, Beyla or another client later — instead of
+        // each one carrying its own copy of the label and the next one silently missing it.
+        val tracesPipeline = pipeline("traces:")
+
+        assertThat(tracesPipeline).contains("resource/cluster")
+        // Before batch, as on the metrics pipelines.
+        assertThat(tracesPipeline.substringAfter("processors:")).containsSubsequence("resource/cluster", "batch")
+    }
+
+    @Test
+    fun `hostmetrics scrapes paging alongside the scrapers it already had`() {
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+        val scrapers = yaml.substringAfter("scrapers:").substringBefore("prometheus:")
+
+        // paging is swap and page faults, and was simply never in the list.
+        assertThat(scrapers).contains("paging:")
+        // Regression guard: adding one scraper must not drop another.
+        assertThat(scrapers).contains("cpu:", "disk:", "load:", "filesystem:", "memory:", "network:", "processes:")
+    }
+
+    @Test
+    fun `the two utilization metrics are switched on explicitly`() {
+        // Measured against the collector image, not assumed: system.filesystem.utilization and
+        // system.paging.utilization are optional metrics and are NOT emitted by default. They are
+        // the ready-made 0-1 fractions the usage-percentage panels want.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("system.filesystem.utilization:")
+        assertThat(yaml).contains("system.paging.utilization:")
+    }
+
+    @Test
+    fun `the filesystem scraper drops squashfs, which the virtual-fs default does not`() {
+        // include_virtual_filesystems defaults to false, so overlay, tmpfs, devtmpfs, sysfs and
+        // proc are already gone. squashfs is device-backed, so it survives that default — and every
+        // snap on an Ubuntu host is one more read-only squashfs mount sitting at 100% full.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("exclude_fs_types:")
+        assertThat(yaml).contains("- squashfs")
+        assertThat(yaml).contains("match_type: strict")
+    }
+
+    /**
+     * The logs pipeline carried the same SDK resource the metrics pipeline used to, and worse:
+     * `process.command_line` is kilobytes of argv on every single record, and VictoriaLogs makes it
+     * part of the stream identity, so it both bloats storage and re-keys the stream whenever
+     * `cassandra use` changes the command line.
+     */
+    @Test
+    fun `buildConfigMap drops the SDK resource from the OTLP logs pipeline too`() {
+        val logsPipeline = pipeline("logs/otlp:")
+
+        assertThat(logsPipeline).contains("resource/drop_sdk_metadata")
+    }
+
+    @Test
+    fun `log-derived metrics are grouped only by logger and severity`() {
+        // Both are bounded sets. Nothing here reads a log body: a message can carry a keyspace, a
+        // table, a host or an id, and grouping on one would be unbounded. That restraint is the
+        // whole cardinality argument for this feature, so it is asserted rather than trusted.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+        val countBlock = yaml.substringAfter("  count:").substringBefore("  signaltometrics:")
+
+        assertThat(countBlock).contains("cassandra.log.records")
+        assertThat(countBlock).contains("- key: logger")
+        assertThat(countBlock).contains("- key: severity")
+        // The only attribute keys the connector groups by.
+        assertThat(Regex("- key: (\\S+)").findAll(countBlock).map { it.groupValues[1] }.toList())
+            .containsOnly("logger", "severity")
+    }
+
+    @Test
+    fun `GC pause duration is parsed out of the log body and summed`() {
+        // GCInspector logs the per-event pause the JVM metrics only aggregate. The pattern was
+        // matched against real lines from both collectors on the cluster - "G1 Young Generation GC
+        // in 635ms" and "ZGC Major Cycles GC in 1465ms" share a shape, so one regex serves both.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("GC in (?P<gc_event_ms>[0-9,]+)ms")
+        assertThat(yaml).contains("cassandra.log.gc_event_duration_seconds")
+        assertThat(yaml).contains("value: Double(attributes[\"gc_event_ms\"]) / 1000")
+        // The collector name is a bounded set, so it is safe as a label.
+        assertThat(yaml).contains("- key: gc_name")
+    }
+
+    @Test
+    fun `compaction figures are parsed as values, never as labels`() {
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("cassandra.log.compaction_duration_seconds")
+        assertThat(yaml).contains("cassandra.log.compaction_sstables_merged")
+        assertThat(yaml).contains("cassandra.log.compaction_ratio")
+        assertThat(yaml).contains("value: Double(attributes[\"compaction_ms\"]) / 1000")
+
+        // The compaction line also carries a uuid and an sstable path. Neither is bounded, so
+        // neither may become a grouping key on any of the three metrics.
+        val valueBlock = yaml.substringAfter("  signaltometrics:").substringBefore("  spanmetrics:")
+        assertThat(Regex("- key: (\\S+)").findAll(valueBlock).map { it.groupValues[1] }.toList())
+            .containsOnly("gc_name", "dropped_type")
+    }
+
+    @Test
+    fun `severity is counted by number, not by the text each library happens to use`() {
+        // Cassandra logs WARN; the AxonOps agent on the same node logs WARNING. Conditioning on the
+        // text would split one level across two series and undercount both.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("severity_number >= SEVERITY_NUMBER_WARN")
+    }
+
+    @Test
+    fun `the loggers worth their own counter each have one`() {
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("cassandra.log.gc_events")
+        assertThat(yaml).contains("cassandra.log.status_dumps")
+        assertThat(yaml).contains("cassandra.log.dropped_message_reports")
+    }
+
+    @Test
+    fun `dropped messages are read from the logger that actually emits them`() {
+        // MessagingMetrics, confirmed against real lines. An earlier condition on MessagingService
+        // and NoSpamLogger - both plausible, both wrong - matched nothing at all while looking
+        // exactly like a cluster that never drops a message. Nothing errors in that state, which is
+        // why the logger name is pinned rather than described.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        // Settings only: the config explains at length why the other two names are wrong, and
+        // names them while doing it.
+        val settings = yaml.lines().filterNot { it.trimStart().startsWith("#") }.joinToString("\n")
+
+        assertThat(settings).contains("MessagingMetrics")
+        assertThat(settings).doesNotContain("NoSpamLogger")
+        assertThat(settings).doesNotContain("MessagingService")
+    }
+
+    @Test
+    fun `dropped messages split internal from cross-node, with the verb as the only label`() {
+        // The JMX counter says how many dropped. Only this line says of what type, and separates a
+        // node dropping its own work from a peer's messages dying in transit.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+
+        assertThat(yaml).contains("cassandra.log.dropped_messages_internal")
+        assertThat(yaml).contains("cassandra.log.dropped_messages_cross_node")
+        assertThat(yaml).contains("cassandra.log.dropped_message_internal_latency_seconds")
+        assertThat(yaml).contains("cassandra.log.dropped_message_cross_node_latency_seconds")
+        assertThat(yaml).contains("- key: dropped_type")
+
+        // Counts are summed, latencies distributed - a count per 5s window adds up to a total,
+        // while a mean latency only means something as a distribution.
+        assertThat(yaml).contains("value: Double(attributes[\"dropped_cross_node\"])")
+        assertThat(yaml).contains("value: Double(attributes[\"dropped_cross_node_ms\"]) / 1000")
+    }
+
+    @Test
+    fun `every parsed number tolerates a thousands separator`() {
+        // Cassandra prints "in 520,866ms" and "31,471 internal". A [0-9]+ capture does not fail
+        // loudly on those: it matches nothing and drops exactly the largest events. Every numeric
+        // capture allows a comma, and every one is stripped before conversion.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+        val captures = Regex("\\(\\?P<(\\w+)>\\[0-9([^\\]]*)\\]").findAll(yaml).toList()
+
+        assertThat(captures).isNotEmpty()
+        assertThat(captures).allSatisfy { match ->
+            assertThat(match.groupValues[2])
+                .describedAs("numeric capture ${match.groupValues[1]} must allow a comma")
+                .contains(",")
+        }
+        // And each one is stripped rather than merely tolerated.
+        captures.forEach { match ->
+            assertThat(yaml).contains("replace_pattern(attributes[\"${match.groupValues[1]}\"], \",\", \"\")")
+        }
+    }
+
+    @Test
+    fun `the log-derived metrics reach the metrics exporter`() {
+        // Three things have to line up or the metrics are built and thrown away: the logs pipeline
+        // must export to the connector, a metrics pipeline must receive from it, and the transform
+        // that supplies the grouping attributes must run before the export.
+        val yaml = yamlFrom(builder.buildConfigMap(emptyList()))
+        val logsPipeline = pipeline("logs/otlp:")
+        val metricsFromLogs = pipeline("metrics/logs:")
+
+        assertThat(logsPipeline).contains("count")
+        assertThat(metricsFromLogs).contains("receivers: [count, signaltometrics]")
+        assertThat(metricsFromLogs).contains("prometheusremotewrite")
+
+        val processors = logsPipeline.substringAfter("processors:").substringBefore("exporters:")
+        assertThat(processors).contains("transform/log_metric_labels")
+        assertThat(yaml).contains("set(attributes[\"logger\"], instrumentation_scope.name)")
+    }
+
     @Test
     fun `buildConfigMap with empty list contains all static scrape jobs`() {
         val configMap = builder.buildConfigMap(emptyList())
@@ -51,7 +325,6 @@ class OtelManifestBuilderTest : BaseKoinTest() {
 
         assertThat(yaml).contains("job_name: 'beyla'")
         assertThat(yaml).contains("job_name: 'ebpf-exporter'")
-        assertThat(yaml).contains("job_name: 'cassandra-maac'")
         assertThat(yaml).contains("job_name: 'yace'")
         assertThat(yaml).contains("job_name: 'hubble'")
     }
@@ -154,7 +427,6 @@ class OtelManifestBuilderTest : BaseKoinTest() {
 
         assertThat(yaml).contains("job_name: 'beyla'")
         assertThat(yaml).contains("job_name: 'ebpf-exporter'")
-        assertThat(yaml).contains("job_name: 'cassandra-maac'")
         assertThat(yaml).contains("job_name: 'yace'")
         assertThat(yaml).contains("job_name: 'hubble'")
         assertThat(yaml).contains("job_name: \"clickhouse-clickhouse\"")

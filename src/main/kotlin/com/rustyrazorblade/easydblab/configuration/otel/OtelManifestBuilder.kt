@@ -22,7 +22,7 @@ import kotlinx.serialization.builtins.ListSerializer
  * Builds all OpenTelemetry Collector K8s resources as typed Fabric8 objects.
  *
  * Creates a DaemonSet that runs on all nodes with hostNetwork, collecting
- * host metrics, Prometheus scrapes (Beyla, ebpf_exporter, MAAC, YACE, Hubble),
+ * host metrics, Prometheus scrapes (Beyla, ebpf_exporter, YACE, Hubble),
  * plus dynamic per-workload scrape jobs from the metrics registry ConfigMaps,
  * file-based logs (system, Cassandra, ClickHouse), and OTLP.
  * Exports to VictoriaMetrics, VictoriaLogs, and Tempo.
@@ -50,6 +50,16 @@ class OtelManifestBuilder(
         private const val READINESS_PERIOD = 10
         private val WORKLOAD_METRICS_LABEL = Constants.K8s.WORKLOAD_METRICS_LABEL
         private const val SCRAPE_INTERVAL = "15s"
+
+        /** Volume carrying the node's root filesystem into the collector container. */
+        const val HOST_ROOT_VOLUME = "host-root"
+
+        /**
+         * Where [HOST_ROOT_VOLUME] is mounted. Must match `root_path` in
+         * `otel-collector-config.yaml`, or the hostmetrics scrapers describe the container instead
+         * of the node.
+         */
+        const val HOST_ROOT_MOUNT_PATH = "/hostfs"
     }
 
     /**
@@ -391,6 +401,15 @@ class OtelManifestBuilder(
                     .withMountPath("/mnt/db1/cassandra/logs")
                     .withReadOnly(true)
                     .build(),
+                // The host root, for the hostmetrics receiver's root_path. Without it the
+                // filesystem scraper enumerates the container's own mounts and finds nothing worth
+                // reporting, which is why every filesystem panel was empty. Read-only: nothing here
+                // writes to the node.
+                VolumeMountBuilder()
+                    .withName(HOST_ROOT_VOLUME)
+                    .withMountPath(HOST_ROOT_MOUNT_PATH)
+                    .withReadOnly(true)
+                    .build(),
             ).withNewLivenessProbe()
             .withNewHttpGet()
             .withPath("/")
@@ -429,6 +448,14 @@ class OtelManifestBuilder(
                 HostPathVolumeSourceBuilder()
                     .withPath("/mnt/db1/container-logs")
                     .withType("DirectoryOrCreate")
+                    .build(),
+            ).endVolume()
+            .addNewVolume()
+            .withName(HOST_ROOT_VOLUME)
+            .withHostPath(
+                HostPathVolumeSourceBuilder()
+                    .withPath("/")
+                    .withType("Directory")
                     .build(),
             ).endVolume()
             .addNewVolume()

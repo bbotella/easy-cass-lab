@@ -1,6 +1,7 @@
 package com.rustyrazorblade.easydblab.commands
 
 import com.fasterxml.jackson.annotation.JsonIgnore
+import com.rustyrazorblade.easydblab.Constants
 import com.rustyrazorblade.easydblab.annotations.McpCommand
 import com.rustyrazorblade.easydblab.annotations.RequireProfileSetup
 import com.rustyrazorblade.easydblab.commands.converters.PicoAZConverter
@@ -68,6 +69,9 @@ class Init : PicoBaseCommand() {
 
         /** Control node instance type. Kept in sync with [InitConfig] control defaults. */
         const val DEFAULT_CONTROL_INSTANCE_TYPE = "m5d.xlarge"
+
+        /** Classpath directory holding the OTel agent's Cassandra JMX rule files. */
+        private const val CASSANDRA_RESOURCE_DIR = "/com/rustyrazorblade/easydblab/configuration/cassandra"
 
         @JsonIgnore val log = KotlinLogging.logger {}
     }
@@ -374,6 +378,12 @@ class Init : PicoBaseCommand() {
     private fun extractResourceFiles() {
         eventBus.emit(Event.Setup.WritingSetupScript)
         extractResourceFile("setup_instance.sh", "setup_instance.sh")
+        // The OTel agent's JMX rules live in the workspace so an operator can edit them and push
+        // them again with `setup-instances`, without a Gradle rebuild.
+        extractResourceFile(
+            "$CASSANDRA_RESOURCE_DIR/${Constants.Cassandra.JMX_RULES_FILE}",
+            Constants.Cassandra.JMX_RULES_FILE,
+        )
     }
 
     private fun extractResourceFile(

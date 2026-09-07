@@ -356,6 +356,28 @@ tasks.register<Exec>("testPackerCassandra") {
         listOf("docker", "compose", "up", "--force-recreate", "--remove-orphans", "--exit-code-from", "test-cassandra", "test-cassandra")
 }
 
+// Unit-test the Fluent Bit journald filter's drop rule: Cassandra's logback lines are duplicates of
+// what the OTel agent already delivers, while its non-logback output (JVM crash, OOM, pre-logback)
+// reaches VictoriaLogs only through the journal. Runs Lua in Docker; no cluster, no Fluent Bit.
+tasks.register<Exec>("testFluentBitFilter") {
+    group = "Verification"
+    description = "Unit-test the Fluent Bit journald Lua filter"
+    workingDir = file(".")
+    commandLine =
+        listOf(
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            "$projectDir:/w:ro",
+            "-w",
+            "/w",
+            "nickblah/lua:5.4-alpine",
+            "lua",
+            "src/main/resources/com/rustyrazorblade/easydblab/configuration/otel/fluent-bit-severity-mapper.test.lua",
+        )
+}
+
 tasks.register("testPacker") {
     group = "Verification"
     description = "Run all packer provisioning tests"
@@ -409,10 +431,11 @@ tasks.register<Exec>("testCassandraUseScript") {
 
 // Unit-test the agent selection cassandra.in.sh runs on every Cassandra start: deriving X.Y from
 // the release jar name (every shape, including the unparseable one) and mapping it to the AxonOps
-// and MCAC agents. Pure functions; no Docker, no network, no node.
+// agent. Also parses cassandra.in.sh under dash, which is the shell Cassandra actually sources it
+// with. Pure functions; no Docker, no network, no node.
 tasks.register<Exec>("testCassandraAgentSelection") {
     group = "Verification"
-    description = "Unit-test Cassandra version derivation and metrics-agent selection"
+    description = "Unit-test Cassandra version derivation and agent selection"
     workingDir = file(".")
     commandLine = listOf("bash", "packer/cassandra/lib/edl-cassandra-agents.test.sh")
 }
