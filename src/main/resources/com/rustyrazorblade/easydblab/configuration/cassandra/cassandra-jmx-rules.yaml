@@ -55,6 +55,17 @@ rules:
         unit: "{task}"
         desc: Estimated number of compactions remaining to perform.
 
+  # A cumulative Counter, so the read attribute is Count (not Value). Incremented once per
+  # compaction from the shared CompactionTask path, by the sum of input scanner bytes, so the
+  # iterator and cursor pipelines report the identical quantity and are directly comparable.
+  - bean: org.apache.cassandra.metrics:type=Compaction,name=BytesCompacted
+    mapping:
+      Count:
+        metric: cassandra.compaction.bytes.compacted
+        type: counter
+        unit: By
+        desc: Total input bytes fed to compaction merges since server start.
+
   # Compaction byte progress. A code-based handler, because the Compactions attribute returns a
   # list of maps that no declarative rule can express. The handler ships in the agent jar and is
   # resolved by name, so it works from this file without the built-in target selected.
