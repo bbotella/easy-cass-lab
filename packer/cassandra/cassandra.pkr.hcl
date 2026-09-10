@@ -46,7 +46,6 @@ locals {
   timestamp = regex_replace(timestamp(), "[- TZ:]", "")
   base_version = var.release_version != "" ? var.release_version : "*"
   version = var.release_version != "" ? var.release_version : local.timestamp
-  ami_groups = var.release_version != "" ? ["all"] : []
   instance_type = var.arch == "amd64" ? "c6i.2xlarge" : "c8g.2xlarge"
 
 
@@ -54,7 +53,6 @@ locals {
 
 source "amazon-ebs" "ubuntu" {
   ami_name      = "rustyrazorblade/images/easy-db-lab-cassandra-${var.arch}-${local.version}"
-  ami_groups    = local.ami_groups
   instance_type = local.instance_type
   region        = "${var.region}"
   # Instance profile so the build can read/write the account S3 download/apt cache.
