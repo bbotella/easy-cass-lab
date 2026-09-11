@@ -203,6 +203,7 @@ class CassandraJmxRulesTest {
             "cassandra.table.memtable.live_data.size",
             "cassandra.table.memtable.columns",
             "cassandra.table.memtable.switches",
+            "cassandra.table.memtable.bytes_flushed",
             "cassandra.commitlog.tasks.pending",
             "cassandra.commitlog.size",
             "cassandra.commitlog.waiting_on_commit.p99",

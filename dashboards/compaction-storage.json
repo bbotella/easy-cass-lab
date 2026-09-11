@@ -2354,6 +2354,223 @@
       ],
       "title": "Repair retries",
       "type": "timeseries"
+    },
+    {
+      "type": "row",
+      "id": 200,
+      "title": "10. Allocation cost of compaction",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 112
+      },
+      "panels": []
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "id": 201,
+      "type": "timeseries",
+      "title": "Compaction throughput vs JVM allocation rate",
+      "description": "The relationship. Left axis: bytes fed to compaction per second per node (rate of cassandra_compaction_bytes_compacted_total). Right axis: whole-JVM allocation per second per node (rate of jvm_memory_allocation_bytes_sum). The two rise together — allocation tracks compaction. Under the identical workload the difference between the allocation lines is the compaction strategy: a cursor-compaction node allocates less for the same bytes compacted. Whole-JVM allocation includes read/flush/messaging, so read it as the trend, not an exact compaction-only figure; the clean compaction-only number lives in Pyroscope.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 113
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "bytes compacted/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "JVM allocated/s"
+              },
+              {
+                "id": "unit",
+                "value": "Bps"
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (rate(cassandra_compaction_bytes_compacted_total{host_name=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "compacted/s {{host_name}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (rate(jvm_memory_allocation_bytes_sum{host_name=~\"$host\"}[$__rate_interval]))",
+          "legendFormat": "allocated/s {{host_name}}",
+          "range": true,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "id": 202,
+      "type": "bargauge",
+      "title": "Allocation per byte compacted (this range)",
+      "description": "The verdict, normalized for work done. Bytes the JVM allocated divided by bytes compacted, over the dashboard range, per node. Dividing by compaction work cancels the fact that nodes compact different amounts, so the bars are directly comparable. A lower bar is a cheaper compaction path. min is pinned to 0 so bar length is proportional to the true value, not the min-max spread. Reads near-infinite until compaction has run enough to make the denominator non-zero. Whole-JVM allocation, comparable across nodes only under an identical workload.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 113
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0,
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(jvm_memory_allocation_bytes_sum{host_name=~\"$host\"}[$__range])) / sum by (host_name) (increase(cassandra_compaction_bytes_compacted_total{host_name=~\"$host\"}[$__range]))",
+          "legendFormat": "{{host_name}}",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "30s",

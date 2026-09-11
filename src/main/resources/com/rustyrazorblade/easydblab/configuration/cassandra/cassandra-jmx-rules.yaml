@@ -514,6 +514,21 @@ rules:
         unit: "{switch}"
         desc: Memtable flushes since startup.
 
+  # Bytes written to SSTables by memtable flush, a cumulative Counter (read Count, not Value). This
+  # is the denominator for write amplification: compaction bytes (cassandra.compaction.bytes.compacted)
+  # divided by this is how many times the flushed data was rewritten. It is independent of the
+  # compaction pipeline, so the iterator and cursor nodes measure amplification against the same base.
+  - bean: org.apache.cassandra.metrics:type=Table,keyspace=*,scope=*,name=BytesFlushed
+    metricAttribute:
+      keyspace: param(keyspace)
+      table: param(scope)
+    mapping:
+      Count:
+        metric: cassandra.table.memtable.bytes_flushed
+        type: counter
+        unit: By
+        desc: Bytes flushed from memtables to SSTables since startup.
+
   # --- commit log --------------------------------------------------------------------------------
   # Where a write path stalls before it ever reaches a memtable. The two waiting families are
   # Timers, so they take the same microsecond treatment as every other latency here.
